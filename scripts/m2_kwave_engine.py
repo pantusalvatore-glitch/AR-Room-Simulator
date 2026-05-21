@@ -57,7 +57,7 @@ try:
     from kwave.kmedium import kWaveMedium
     from kwave.ksensor import kSensor
     from kwave.ksource import kSource
-    from kwave.kspaceFirstOrder3D import kspaceFirstOrder3D
+    from kwave.kspaceFirstOrder import kspaceFirstOrder
     from kwave.options.simulation_execution_options import SimulationExecutionOptions
     from kwave.options.simulation_options import SimulationOptions
     from kwave.utils.signals import tone_burst
@@ -373,6 +373,7 @@ class KWaveEngine:
         # --- Step 3: costruisce opzioni GPU ---
         exec_options = SimulationExecutionOptions(
             is_gpu_simulation=True,
+            binary_dir=env_path if env_path else None,
         )
         return exec_options
 
@@ -933,9 +934,15 @@ class KWaveEngine:
         try:
             logger.info("Avvio simulazione k-Wave FDTD (GPU)...")
 
+            # pml_size vuole parametri separati per asse in kwave 0.6.x
+            _pml = int(self.sp.pml_size)
             sim_options = SimulationOptions(
-                pml_size=self.sp.pml_size,
-                pml_alpha=PML_ALPHA,
+                pml_x_size=_pml,
+                pml_y_size=_pml,
+                pml_z_size=_pml,
+                pml_x_alpha=float(PML_ALPHA),
+                pml_y_alpha=float(PML_ALPHA),
+                pml_z_alpha=float(PML_ALPHA),
                 smooth_p0=self.sp.smooth_source,
                 save_to_disk=True,
                 input_filename=str(input_hdf5),
@@ -943,7 +950,7 @@ class KWaveEngine:
                 data_cast="single",         # float32 per ridurre RAM GPU
             )
 
-            sensor_data = kspaceFirstOrder3D(
+            sensor_data = kspaceFirstOrder(
                 medium=medium,
                 kgrid=grid,
                 source=source,
