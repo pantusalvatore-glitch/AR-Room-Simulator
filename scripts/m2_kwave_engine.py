@@ -365,16 +365,17 @@ class KWaveEngine:
 
         # --- Step 2: verifica binario kspaceFirstOrder3DC ---
         kwave_bin = self._find_kwave_binary()
-        logger.info(
-            "GPU enforcement OK [%s] | binario k-Wave: %s",
-            cuda_source, kwave_bin,
-        )
-
-        # --- Step 3: costruisce opzioni GPU ---
-        exec_options = SimulationExecutionOptions(
-            is_gpu_simulation=True,
-            binary_dir=env_path if env_path else None,
-        )
+         logger.info(
+              "GPU enforcement OK [%s] | binario k-Wave: %s",
+              cuda_source, kwave_bin,                                                                                                                          
+          )
+                                                                                                                                                               
+          # --- Step 3: costruisce opzioni GPU ---
+          env_path = os.environ.get("KWAVE_BIN_PATH", "")
+          exec_options = SimulationExecutionOptions(                                                                                                           
+              is_gpu_simulation=True,
+              binary_dir=env_path if env_path else None,                                                                                                       
+          )
         return exec_options
 
     @staticmethod
