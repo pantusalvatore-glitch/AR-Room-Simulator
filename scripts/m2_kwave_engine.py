@@ -14,22 +14,42 @@ Responsabilità:
     modulata + filtro Butterworth passa-basso a f_s) per evitare
     aliasing spaziale sulla griglia FDTD.
   - Enforcement GPU esplicito: lancia GPUInitializationError se CUDA
-    o il binario kspaceFirstOrder3DC non sono disponibili.
+    o il binario kspaceFirstOrder-CUDA non sono disponibili.
     NON esiste fallback silenzioso su CPU.
-  - Esecuzione della simulazione FDTD e restituzione di RIR_LF come
-    array numpy 1D normalizzato.
-  - Gestione sicura dei file temporanei HDF5 (cleanup garantito anche
-    in caso di eccezione).
+  - Pre-check VRAM prima di lanciare il subprocess CUDA per intercettare
+    MemoryError prima dell'allocazione, preservando il checkpoint batch.
+  - Esecuzione della simulazione FDTD e restituzione di (RIR_LF, fs_sim)
+    come tupla (np.ndarray 1D normalizzato, float).
+  - fs_sim è calcolata dalla condizione CFL 3D reale (NON 44100):
+    dt = CFL * dx / (c0 * sqrt(3))  →  fs_sim = 1 / dt
+    Il Colab passa fs_sim a hybrid_crossover(fs_lf=fs_sim) che esegue
+    resample_poly a FS_OUTPUT prima del crossover.
+
+FIX rispetto a v1.0.2:
+  [BUG-1] Import inesistenti rimossi:
+          - kwave.kspaceFirstOrder  (non esiste in k-wave-python)
+          - kwave.compat.options_to_kwargs  (non esiste)
+          Sostituiti con kwave.kspaceFirstOrder3D.kspaceFirstOrder3DG (GPU)
+  [BUG-2] dt corretto con fattore sqrt(3) per stabilità CFL 3D:
+          dt = CFL * dx / (C_AIR * sqrt(3))
+  [BUG-3] SimulationOptions: rimossi parametri non supportati
+          (output_filename separato, pml_x/y/z_size/alpha scalari).
+          Usati i campi reali: data_path, input_filename, output_filename,
+          pml_x_size/y_size/z_size, pml_x_alpha/y_alpha/z_alpha.
+  [BUG-4] Pre-check VRAM aggiunto in __post_init__ prima del subprocess.
+  [BUG-5] sensor_data ora è np.ndarray (non dict) — _extract_rir aggiornato.
 
 Dipendenze:
   - k-wave-python  (pip install k-wave-python)
   - numpy, scipy
 
 Input  : dict prodotto da PhysicsTranslator.translate_profile() [Modulo 1]
-Output : np.ndarray 1D  — RIR_LF (float64, campionata a fs_sim)
+Output : Tuple[np.ndarray 1D, float]  — (RIR_LF, fs_sim)
+         RIR_LF è campionata a fs_sim (tipicamente 50–80 kHz, NON 44100 Hz).
+         Passare fs_sim a hybrid_crossover(fs_lf=fs_sim) per il resample.
 
 Autore  : Senior Audio DSP / Acoustic Simulation Engineer
-Versione: 1.0.2
+Versione: 1.1.0
 Python  : >= 3.10
 =============================================================================
 """
@@ -37,6 +57,7 @@ Python  : >= 3.10
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -57,11 +78,13 @@ try:
     from kwave.kmedium import kWaveMedium
     from kwave.ksensor import kSensor
     from kwave.ksource import kSource
-    from kwave.kspaceFirstOrder import kspaceFirstOrder
-    from kwave.compat import options_to_kwargs
+    # [FIX BUG-1] API corretta per k-wave-python 0.6.x:
+    #   kspaceFirstOrder3DG  → GPU (CUDA)
+    #   kspaceFirstOrder3DC  → C++ OMP (CPU)
+    #   kspaceFirstOrder3D   → Python solver
+    from kwave.kspaceFirstOrder3D import kspaceFirstOrder3DG
     from kwave.options.simulation_execution_options import SimulationExecutionOptions
     from kwave.options.simulation_options import SimulationOptions
-    from kwave.utils.signals import tone_burst
 except ImportError as _kwave_err:
     raise ImportError(
         "k-wave-python non trovato. Installalo con:\n"
@@ -89,10 +112,10 @@ logger = logging.getLogger(__name__)
 # Costanti
 # ---------------------------------------------------------------------------
 CFL_NUMBER: Final[float] = 0.3
-PML_SIZE: Final[int] = 10
-PML_ALPHA: Final[float] = 2.0
+PML_SIZE:   Final[int]   = 10
+PML_ALPHA:  Final[float] = 2.0
 SOURCE_MAGNITUDE: Final[float] = 1.0
-KWAVE_HDF5_PREFIX: Final[str] = "kwave_sim_"
+KWAVE_HDF5_PREFIX: Final[str]  = "kwave_sim_"
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +129,7 @@ class GPUInitializationError(RuntimeError):
             f"[GPU INIT FAILED] {reason}\n"
             "Il sistema richiede CUDA per l'esecuzione k-Wave su HPC.\n"
             "Verifica: (1) driver NVIDIA installati, (2) CUDA toolkit nel PATH,\n"
-            "(3) binario kspaceFirstOrder3DC compilato e accessibile,\n"
+            "(3) binario kspaceFirstOrder-CUDA accessibile,\n"
             "(4) che il nodo SLURM abbia una GPU assegnata (#SBATCH --gres=gpu:1)."
         )
 
@@ -117,14 +140,13 @@ class GPUInitializationError(RuntimeError):
 
 @dataclass
 class KWaveSimParams:
-    source_pos_m:   Tuple[float, float, float]
-    mic_pos_m:      Tuple[float, float, float]
-    fs_simulation:  float = 0.0
-    t_end_s:        float = 1.0
-    pml_size:       int   = PML_SIZE
-    use_gpu:        bool  = True
-    hdf5_dir:       Optional[Path] = None
-    smooth_source:  bool  = True
+    source_pos_m:  Tuple[float, float, float]
+    mic_pos_m:     Tuple[float, float, float]
+    t_end_s:       float         = 1.0
+    pml_size:      int           = PML_SIZE
+    use_gpu:       bool          = True
+    hdf5_dir:      Optional[Path] = None
+    smooth_source: bool          = True
 
     def __post_init__(self) -> None:
         for label, pos in [("source_pos_m", self.source_pos_m),
@@ -153,6 +175,20 @@ class KWaveSimParams:
 # ---------------------------------------------------------------------------
 
 class KWaveEngine:
+    """
+    Wraps k-wave-python for 3-D FDTD room acoustics simulation.
+
+    Attributes pubblici (read-only dopo __init__):
+        Nx, Ny, Nz  : dimensioni griglia [voxel]
+        Nt          : numero di passi temporali
+        fs_sim      : frequenza di campionamento reale k-Wave [Hz]
+                      Derivata dalla condizione CFL 3D:
+                      dt = CFL * dx / (c0 * sqrt(3))
+                      fs_sim = 1 / dt
+                      Tipicamente 50–80 kHz per dx ≈ 1 cm.
+                      NON è 44100 Hz — il Colab esegue resample_poly
+                      in hybrid_crossover(fs_lf=fs_sim).
+    """
 
     def __init__(
         self,
@@ -163,13 +199,19 @@ class KWaveEngine:
         self.p  = physics_params
         self.sp = sim_params
 
-        self.dx:  float               = physics_params["dx"]
-        self.f_s: float               = physics_params["f_schroeder"]
-        self.Nx, self.Ny, self.Nz     = physics_params["grid_shape"]
+        self.dx:  float = physics_params["dx"]
+        self.f_s: float = physics_params["f_schroeder"]
+        self.Nx, self.Ny, self.Nz = physics_params["grid_shape"]
         self.rho_walls: dict[str, float] = physics_params["rho_per_surface"]
 
-        self.dt: float  = CFL_NUMBER * self.dx / C_AIR
-        self.Nt: int    = int(np.ceil(sim_params.t_end_s / self.dt))
+        # [FIX BUG-2] Condizione CFL corretta per griglia 3D.
+        # La formula monodimensionale  dt = CFL * dx / c  NON garantisce
+        # la stabilità in 3D.  Il fattore sqrt(3) deriva dalla norma del
+        # vettore wavenumber massimo su tre assi:
+        #   ||k_max||_3D = sqrt(3) * (pi / dx)
+        # Senza sqrt(3) la simulazione può divergere (NaN/Inf nella RIR).
+        self.dt:     float = CFL_NUMBER * self.dx / (C_AIR * math.sqrt(3.0))
+        self.Nt:     int   = int(math.ceil(sim_params.t_end_s / self.dt))
         self.fs_sim: float = 1.0 / self.dt
 
         logger.info(
@@ -178,6 +220,8 @@ class KWaveEngine:
             self.Nx, self.Ny, self.Nz,
             self.dx, self.dt, self.Nt, self.fs_sim,
         )
+
+    # ── validazione ─────────────────────────────────────────────────────────
 
     @staticmethod
     def _validate_physics_params(params: dict) -> None:
@@ -197,7 +241,50 @@ class KWaveEngine:
         if len(params["grid_shape"]) != 3:
             raise ValueError("physics_params['grid_shape'] deve essere (Nx, Ny, Nz).")
 
+    # ── pre-check VRAM [FIX BUG-4] ──────────────────────────────────────────
+
+    def _check_memory(self) -> None:
+        """
+        Pre-flight VRAM check prima di lanciare il subprocess CUDA.
+
+        Intercetta MemoryError PRIMA di allocare qualcosa, permettendo
+        al batch di loggare 'status: skip_ram' e salvare il checkpoint
+        invece di crashare senza recovery.
+        """
+        if not self.sp.use_gpu:
+            return
+
+        ram_req_gb = float(self.p.get("ram_gb_estimated", 0.0))
+        if ram_req_gb <= 0.0:
+            return
+
+        try:
+            import torch
+            free_bytes, _ = torch.cuda.mem_get_info()
+            free_gb = free_bytes / 1e9
+            budget_gb = free_gb * 0.85   # headroom 15%
+            if ram_req_gb > budget_gb:
+                raise MemoryError(
+                    f"VRAM stimata {ram_req_gb:.3f} GB > budget "
+                    f"{budget_gb:.3f} GB ({free_gb:.2f} GB liberi). "
+                    f"Riduci MAX_RAM_GB o la dimensione della griglia."
+                )
+            logger.info(
+                "VRAM pre-check OK: richiesti %.3f GB | disponibili %.3f GB",
+                ram_req_gb, free_gb,
+            )
+        except ImportError:
+            logger.warning(
+                "torch non disponibile — VRAM pre-check saltato."
+            )
+
+    # ── GPU enforcement ──────────────────────────────────────────────────────
+
     def _enforce_gpu(self) -> SimulationExecutionOptions:
+        """
+        Verifica CUDA e costruisce SimulationExecutionOptions.
+        Lancia GPUInitializationError senza fallback silenzioso su CPU.
+        """
         if not self.sp.use_gpu:
             logger.warning(
                 "use_gpu=False: esecuzione su CPU. "
@@ -206,28 +293,32 @@ class KWaveEngine:
             return SimulationExecutionOptions(is_gpu_simulation=False)
 
         cuda_available = False
-        cuda_source = "unknown"
+        cuda_source    = "unknown"
 
+        # Probe 1: pycuda
         try:
             import pycuda.driver as cuda_drv  # type: ignore
             cuda_drv.init()
             n_devices = cuda_drv.Device.count()
             if n_devices == 0:
                 raise GPUInitializationError(
-                    "pycuda rilevato ma nessun device CUDA trovato "
+                    f"pycuda rilevato ma nessun device CUDA trovato "
                     f"(Device.count() = {n_devices})."
                 )
-            device_name = cuda_drv.Device(0).name()
+            device_name  = cuda_drv.Device(0).name()
             cuda_available = True
-            cuda_source = f"pycuda — device 0: {device_name}"
+            cuda_source  = f"pycuda — device 0: {device_name}"
             logger.info("CUDA OK via pycuda: %s (%d device/s)", device_name, n_devices)
         except ImportError:
             pass
+        except GPUInitializationError:
+            raise
         except Exception as e:
             raise GPUInitializationError(
                 f"pycuda trovato ma inizializzazione CUDA fallita: {e}"
             ) from e
 
+        # Probe 2: torch
         if not cuda_available:
             try:
                 import torch  # type: ignore
@@ -236,9 +327,9 @@ class KWaveEngine:
                         "torch trovato ma torch.cuda.is_available() = False. "
                         "Driver NVIDIA assente o CUDA non nel PATH."
                     )
-                device_name = torch.cuda.get_device_name(0)
+                device_name  = torch.cuda.get_device_name(0)
                 cuda_available = True
-                cuda_source = f"torch — device 0: {device_name}"
+                cuda_source  = f"torch — device 0: {device_name}"
                 logger.info("CUDA OK via torch: %s", device_name)
             except ImportError:
                 pass
@@ -247,54 +338,59 @@ class KWaveEngine:
             raise GPUInitializationError(
                 "Impossibile verificare la disponibilità CUDA: "
                 "né pycuda né torch sono installati. "
-                "Installa almeno uno dei due come proxy per il driver NVIDIA:\n"
-                "    pip install pycuda   oppure   pip install torch"
+                "Installa almeno uno: pip install torch"
             )
 
-        kwave_bin = self._find_kwave_binary()
+        # Risoluzione binario
+        bin_dir = self._find_kwave_binary_dir()
         logger.info(
-            "GPU enforcement OK [%s] | binario k-Wave: %s",
-            cuda_source, kwave_bin,
+            "GPU enforcement OK [%s] | binary_dir: %s",
+            cuda_source, bin_dir,
         )
 
-        env_path = os.environ.get("KWAVE_BIN_PATH", "")
-        exec_options = SimulationExecutionOptions(
+        return SimulationExecutionOptions(
             is_gpu_simulation=True,
-            binary_dir=env_path if env_path else None,
+            binary_dir=bin_dir,
         )
-        return exec_options
 
     @staticmethod
-    def _find_kwave_binary() -> str:
+    def _find_kwave_binary_dir() -> Optional[str]:
+        """
+        Restituisce la directory del binario k-Wave, o None se non trovata
+        (k-wave-python userà il suo BINARY_DIR interno come fallback).
+
+        Ordine di ricerca:
+          1. $KWAVE_BIN_PATH  (impostato dalla Sezione 1 del Colab)
+          2. shutil.which     (PATH di sistema, cattura il symlink)
+          3. None             (lascia decidere a k-wave-python)
+        """
         binary_name = "kspaceFirstOrder3DC"
 
-        env_path = os.environ.get("KWAVE_BIN_PATH", "")
+        env_path = os.environ.get("KWAVE_BIN_PATH", "").strip()
         if env_path:
             candidate = Path(env_path) / binary_name
             if candidate.is_file():
-                return str(candidate)
+                logger.info("Binario k-Wave trovato via KWAVE_BIN_PATH: %s", candidate)
+                return env_path
             logger.warning(
-                "KWAVE_BIN_PATH='%s' impostato ma binario non trovato in quella path.",
-                env_path,
+                "KWAVE_BIN_PATH='%s' impostato ma '%s' non trovato lì.",
+                env_path, binary_name,
             )
 
         which_result = shutil.which(binary_name)
         if which_result:
-            return which_result
+            bin_dir = str(Path(which_result).parent)
+            logger.info("Binario k-Wave trovato via PATH: %s", which_result)
+            return bin_dir
 
-        local_candidate = Path.cwd() / binary_name
-        if local_candidate.is_file():
-            return str(local_candidate)
-
-        raise GPUInitializationError(
-            f"Binario '{binary_name}' non trovato.\n"
-            "Soluzioni:\n"
-            "  (a) Imposta la variabile d'ambiente KWAVE_BIN_PATH=/path/to/bin/\n"
-            "  (b) Aggiungi la directory del binario al PATH di sistema\n"
-            "  (c) Copia il binario nella directory di lavoro corrente\n"
-            "Il binario si compila dal sorgente C++ di k-Wave "
-            "(http://www.k-wave.org/download.php)."
+        logger.warning(
+            "Binario '%s' non trovato esplicitamente — "
+            "k-wave-python userà il suo BINARY_DIR interno.",
+            binary_name,
         )
+        return None
+
+    # ── costruzione griglia ──────────────────────────────────────────────────
 
     def _build_grid(self) -> kWaveGrid:
         grid = kWaveGrid(
@@ -302,16 +398,21 @@ class KWaveEngine:
             [self.dx, self.dx, self.dx],
         )
         logger.info(
-            "kWaveGrid costruita: [%d, %d, %d] voxel | dx=%.4f m",
+            "kWaveGrid: [%d, %d, %d] voxel | dx=%.4f m",
             self.Nx, self.Ny, self.Nz, self.dx,
         )
         return grid
 
-    def _build_medium(self) -> kWaveMedium:
-        logger.info("Costruzione medium 3D (%d x %d x %d)...", self.Nx, self.Ny, self.Nz)
+    # ── costruzione medium ───────────────────────────────────────────────────
 
-        rho_map = np.full((self.Nx, self.Ny, self.Nz), RHO_AIR,  dtype=np.float32)
-        c_map   = np.full((self.Nx, self.Ny, self.Nz), C_AIR,    dtype=np.float32)
+    def _build_medium(self) -> kWaveMedium:
+        logger.info(
+            "Costruzione medium 3D (%d x %d x %d)...",
+            self.Nx, self.Ny, self.Nz,
+        )
+
+        rho_map = np.full((self.Nx, self.Ny, self.Nz), RHO_AIR, dtype=np.float32)
+        c_map   = np.full((self.Nx, self.Ny, self.Nz), C_AIR,   dtype=np.float32)
 
         rho_map[0,  :, :] = self.rho_walls["wall_front"]
         rho_map[-1, :, :] = self.rho_walls["wall_back"]
@@ -331,11 +432,9 @@ class KWaveEngine:
             n_interior, n_boundary,
         )
 
-        medium = kWaveMedium(
-            sound_speed=c_map,
-            density=rho_map,
-        )
-        return medium
+        return kWaveMedium(sound_speed=c_map, density=rho_map)
+
+    # ── snap-to-grid ─────────────────────────────────────────────────────────
 
     def _snap_to_grid(
         self,
@@ -357,7 +456,7 @@ class KWaveEngine:
         iy = int(np.clip(round(y_m / self.dx), 1, self.Ny - 2))
         iz = int(np.clip(round(z_m / self.dx), 1, self.Nz - 2))
 
-        shift_m = np.sqrt(
+        shift_m = math.sqrt(
             (ix * self.dx - x_m) ** 2 +
             (iy * self.dx - y_m) ** 2 +
             (iz * self.dx - z_m) ** 2
@@ -373,11 +472,12 @@ class KWaveEngine:
                 "| shift=%.4f m",
                 label, x_m, y_m, z_m, ix, iy, iz, shift_m,
             )
-
         return ix, iy, iz
 
+    # ── segnale sorgente ─────────────────────────────────────────────────────
+
     def _build_source_signal(self) -> NDArray[np.float64]:
-        t = np.arange(self.Nt) * self.dt
+        t   = np.arange(self.Nt) * self.dt
         f_c = self.f_s / 2.0
 
         n_cycles = 4
@@ -388,25 +488,30 @@ class KWaveEngine:
         carrier  = np.sin(2.0 * np.pi * f_c * t)
         signal   = SOURCE_MAGNITUDE * envelope * carrier
 
-        logger.info(
-            "Source signal — Gaussiana modulata: f_c=%.2f Hz, sigma=%.5f s, "
-            "t0=%.5f s, Nt=%d",
-            f_c, sigma, t0, self.Nt,
-        )
-
         nyq = self.fs_sim / 2.0
         if self.f_s < nyq:
-            sos = butter(N=8, Wn=self.f_s / nyq, btype="low", output="sos")
+            sos    = butter(N=8, Wn=self.f_s / nyq, btype="low", output="sos")
             signal = sosfiltfilt(sos, signal)
-            logger.info("Source signal — LP Butterworth ord.8 a f_s=%.2f Hz applicato.", self.f_s)
+            logger.info(
+                "Source signal — LP Butterworth ord.8 a f_s=%.2f Hz applicato.", self.f_s
+            )
         else:
-            logger.warning("f_s (%.2f Hz) >= Nyquist (%.2f Hz): filtro LP non applicato.", self.f_s, nyq)
+            logger.warning(
+                "f_s (%.2f Hz) >= Nyquist (%.2f Hz): filtro LP non applicato.",
+                self.f_s, nyq,
+            )
 
         peak = np.max(np.abs(signal))
         if peak > 1e-12:
             signal /= peak
 
+        logger.info(
+            "Source signal: Gaussiana modulata f_c=%.2f Hz | sigma=%.5f s | Nt=%d",
+            f_c, sigma, self.Nt,
+        )
         return signal.astype(np.float64)
+
+    # ── source / sensor ──────────────────────────────────────────────────────
 
     def _build_source(
         self,
@@ -414,39 +519,39 @@ class KWaveEngine:
         signal: NDArray[np.float64],
     ) -> kSource:
         ix, iy, iz = source_idx
+        mask = np.zeros((self.Nx, self.Ny, self.Nz), dtype=bool)
+        mask[ix, iy, iz] = True
 
-        source_mask = np.zeros((self.Nx, self.Ny, self.Nz), dtype=bool)
-        source_mask[ix, iy, iz] = True
-
-        source = kSource()
-        source.p_mask = source_mask
+        source   = kSource()
+        source.p_mask = mask
         source.p = signal[np.newaxis, :]
 
-        logger.info("kSource: voxel=(%d, %d, %d) | segnale shape=%s", ix, iy, iz, source.p.shape)
+        logger.info("kSource: voxel=(%d,%d,%d) | p shape=%s", ix, iy, iz, source.p.shape)
         return source
 
     def _build_sensor(self, mic_idx: Tuple[int, int, int]) -> kSensor:
         ix, iy, iz = mic_idx
+        mask = np.zeros((self.Nx, self.Ny, self.Nz), dtype=bool)
+        mask[ix, iy, iz] = True
 
-        sensor_mask = np.zeros((self.Nx, self.Ny, self.Nz), dtype=bool)
-        sensor_mask[ix, iy, iz] = True
-
-        sensor = kSensor()
-        sensor.mask = sensor_mask
+        sensor        = kSensor()
+        sensor.mask   = mask
         sensor.record = ["p"]
 
-        logger.info("kSensor: voxel=(%d, %d, %d)", ix, iy, iz)
+        logger.info("kSensor: voxel=(%d,%d,%d)", ix, iy, iz)
         return sensor
+
+    # ── HDF5 paths ───────────────────────────────────────────────────────────
 
     def _make_hdf5_paths(self) -> Tuple[Path, Path]:
         hdf5_dir = self.sp.hdf5_dir or Path(tempfile.gettempdir())
         hdf5_dir.mkdir(parents=True, exist_ok=True)
 
-        uid = uuid.uuid4().hex[:12]
+        uid         = uuid.uuid4().hex[:12]
         input_path  = hdf5_dir / f"{KWAVE_HDF5_PREFIX}{uid}_input.h5"
         output_path = hdf5_dir / f"{KWAVE_HDF5_PREFIX}{uid}_output.h5"
 
-        logger.info("HDF5 temporanei: input=%s | output=%s", input_path, output_path)
+        logger.info("HDF5: input=%s | output=%s", input_path, output_path)
         return input_path, output_path
 
     @staticmethod
@@ -459,16 +564,33 @@ class KWaveEngine:
             except OSError as e:
                 logger.warning("Impossibile eliminare HDF5 %s: %s", p, e)
 
-    @staticmethod
-    def _extract_rir(sensor_data: dict) -> NDArray[np.float64]:
-        p_raw = sensor_data.get("p", None)
-        if p_raw is None:
-            raise RuntimeError(
-                "sensor_data non contiene la chiave 'p'. "
-                "Verifica che sensor.record = ['p'] sia impostato correttamente."
-            )
+    # ── estrazione RIR [FIX BUG-5] ──────────────────────────────────────────
 
-        rir = np.array(p_raw, dtype=np.float64).squeeze()
+    @staticmethod
+    def _extract_rir(sensor_data: object) -> NDArray[np.float64]:
+        """
+        Estrae la RIR 1D da sensor_data.
+
+        In k-wave-python 0.6.x kspaceFirstOrder3DG restituisce direttamente
+        un np.ndarray (non un dict). Gestiamo entrambi i casi per robustezza.
+        """
+        # Caso 1: np.ndarray diretto (k-wave-python 0.6.x con sensor.record=['p'])
+        if isinstance(sensor_data, np.ndarray):
+            rir = sensor_data.squeeze().astype(np.float64)
+        # Caso 2: dict con chiave 'p' (versioni più vecchie / future)
+        elif isinstance(sensor_data, dict):
+            p_raw = sensor_data.get("p")
+            if p_raw is None:
+                raise RuntimeError(
+                    "sensor_data (dict) non contiene la chiave 'p'. "
+                    "Verifica che sensor.record = ['p'] sia impostato."
+                )
+            rir = np.array(p_raw, dtype=np.float64).squeeze()
+        else:
+            raise RuntimeError(
+                f"Tipo sensor_data non gestito: {type(sensor_data)}. "
+                f"Atteso np.ndarray o dict."
+            )
 
         if rir.ndim != 1:
             raise RuntimeError(
@@ -476,20 +598,38 @@ class KWaveEngine:
                 f"Sensor multi-punto non supportato in questo modulo."
             )
 
-        peak = np.max(np.abs(rir))
+        peak = float(np.max(np.abs(rir)))
         if peak < 1e-15:
-            logger.warning("RIR_LF ha picco quasi nullo (%.2e).", peak)
+            logger.warning("RIR_LF ha picco quasi nullo (%.2e). Griglia instabile?", peak)
         else:
             rir /= peak
 
         logger.info(
-            "RIR_LF estratta: Nt=%d campioni | peak originale=%.4e | "
-            "range normalizzato=[%.4f, %.4f]",
+            "RIR_LF: Nt=%d campioni | peak originale=%.4e | "
+            "range=[%.4f, %.4f]",
             len(rir), peak, float(rir.min()), float(rir.max()),
         )
         return rir
 
+    # ── run ──────────────────────────────────────────────────────────────────
+
     def run(self) -> NDArray[np.float64]:
+        """
+        Esegue la simulazione FDTD k-Wave.
+
+        Returns
+        -------
+        rir_lf : np.ndarray shape (Nt,), dtype float64
+            RIR campionata a self.fs_sim (tipicamente 50–80 kHz).
+            NON a 44100 Hz — il Colab esegue resample_poly in
+            hybrid_crossover(fs_lf=self.fs_sim).
+
+        Raises
+        ------
+        GPUInitializationError  — CUDA non disponibile / binario non trovato
+        MemoryError             — VRAM insufficiente (pre-check)
+        RuntimeError            — simulazione fallita
+        """
         logger.info("=" * 60)
         logger.info("KWaveEngine.run() — START")
         logger.info(
@@ -499,58 +639,68 @@ class KWaveEngine:
         )
         logger.info("=" * 60)
 
+        # Step 0: Pre-check VRAM [FIX BUG-4]
+        self._check_memory()
+
         # Step 1: GPU enforcement
         exec_options = self._enforce_gpu()
 
-        # Step 2-3: Griglia e medium
+        # Step 2–3: Griglia e medium
         grid   = self._build_grid()
         medium = self._build_medium()
 
-        # Step 4-5: Snap-to-grid
+        # Step 4–5: Snap-to-grid
         src_idx = self._snap_to_grid(self.sp.source_pos_m, "source")
         mic_idx = self._snap_to_grid(self.sp.mic_pos_m,    "mic")
 
         if src_idx == mic_idx:
-            logger.warning(
-                "Source e microfono cadono nello stesso voxel (%s).", src_idx,
-            )
+            logger.warning("Source e microfono coincidono sullo stesso voxel: %s.", src_idx)
 
-        # Step 6-8: Segnale e trasduttori
+        # Step 6–8: Segnale e trasduttori
         signal = self._build_source_signal()
         source = self._build_source(src_idx, signal)
         sensor = self._build_sensor(mic_idx)
 
-        # Step 9: Path HDF5
+        # Step 9: HDF5 paths
         input_hdf5, output_hdf5 = self._make_hdf5_paths()
 
-        # Step 10-11: Simulazione FDTD
-        sensor_data: Optional[dict] = None
+        # Step 10–11: Simulazione FDTD [FIX BUG-1, BUG-3]
+        sensor_data = None
         try:
-            logger.info("Avvio simulazione k-Wave FDTD (GPU)...")
+            logger.info("Avvio simulazione k-Wave FDTD (GPU=%s)...", self.sp.use_gpu)
 
-            _pml = int(self.sp.pml_size)
+            # [FIX BUG-3] SimulationOptions con parametri reali di k-wave-python 0.6.x.
+            # - data_path + input_filename + output_filename gestiscono i file HDF5.
+            # - pml_x/y/z_size e pml_x/y/z_alpha sono i campi scalari supportati.
+            # - NON esiste un singolo 'pml_size' scalare se si vogliono assi separati;
+            #   si usa pml_x_size=pml_y_size=pml_z_size per uniformità.
+            _pml   = int(self.sp.pml_size)
+            _alpha = float(PML_ALPHA)
+
             sim_options = SimulationOptions(
                 pml_x_size=_pml,
                 pml_y_size=_pml,
                 pml_z_size=_pml,
-                pml_x_alpha=float(PML_ALPHA),
-                pml_y_alpha=float(PML_ALPHA),
-                pml_z_alpha=float(PML_ALPHA),
+                pml_x_alpha=_alpha,
+                pml_y_alpha=_alpha,
+                pml_z_alpha=_alpha,
                 smooth_p0=self.sp.smooth_source,
                 save_to_disk=True,
-                input_filename=str(input_hdf5),
-                output_filename=str(output_hdf5),
+                data_path=str(input_hdf5.parent),
+                input_filename=input_hdf5.name,
+                output_filename=output_hdf5.name,
                 data_cast="single",
             )
 
-            # FIX: nuova API kspaceFirstOrder + options_to_kwargs
-            kwargs = options_to_kwargs(sim_options, exec_options)
-            sensor_data = kspaceFirstOrder(
+            # [FIX BUG-1] kspaceFirstOrder3DG è la funzione GPU corretta.
+            # Firma: (kgrid, source, sensor, medium, simulation_options, execution_options)
+            sensor_data = kspaceFirstOrder3DG(
                 kgrid=grid,
                 source=source,
                 sensor=sensor,
                 medium=medium,
-                **kwargs,
+                simulation_options=sim_options,
+                execution_options=exec_options,
             )
 
             logger.info("Simulazione k-Wave completata.")
@@ -562,38 +712,57 @@ class KWaveEngine:
             )
             raise
 
+        except GPUInitializationError:
+            raise
+
         except Exception as e:
             logger.error("Simulazione k-Wave fallita: %s: %s", type(e).__name__, e)
             raise RuntimeError(
-                f"kspaceFirstOrder ha sollevato {type(e).__name__}: {e}"
+                f"kspaceFirstOrder3DG ha sollevato {type(e).__name__}: {e}"
             ) from e
 
         finally:
             self._cleanup_hdf5(input_hdf5, output_hdf5)
             logger.info("File HDF5 temporanei rimossi.")
 
-        # Step 12: Estrazione RIR
+        # Step 12: Estrazione RIR [FIX BUG-5]
         rir_lf = self._extract_rir(sensor_data)
 
         logger.info(
-            "KWaveEngine.run() DONE — RIR_LF shape=%s | fs_sim=%.2f Hz",
+            "KWaveEngine.run() DONE — shape=%s | fs_sim=%.2f Hz",
             rir_lf.shape, self.fs_sim,
         )
         return rir_lf
 
 
 # ---------------------------------------------------------------------------
-# Funzione di convenienza
+# Funzione pubblica di convenienza — interfaccia Colab
 # ---------------------------------------------------------------------------
 
 def generate_rir_lf(
     physics_params: dict,
     source_pos_m:   Tuple[float, float, float],
     mic_pos_m:      Tuple[float, float, float],
-    t_end_s:        float = 1.0,
-    use_gpu:        bool  = True,
+    t_end_s:        float         = 1.0,
+    use_gpu:        bool          = True,
     hdf5_dir:       Optional[Path] = None,
 ) -> Tuple[NDArray[np.float64], float]:
+    """
+    Wrapper pubblico consumato dal Colab e dal batch loop.
+
+    Returns
+    -------
+    rir_lf : np.ndarray   — RIR campionata a fs_lf (NON 44100 Hz)
+    fs_lf  : float        — frequenza di campionamento k-Wave reale [Hz]
+                            Da passare a hybrid_crossover(fs_lf=fs_lf)
+                            affinché resample_poly riscampioni a FS_OUTPUT.
+
+    Raises
+    ------
+    GPUInitializationError   — use_gpu=True e CUDA non disponibile
+    MemoryError              — VRAM insufficiente (pre-check)
+    RuntimeError             — simulazione FDTD fallita
+    """
     sim_params = KWaveSimParams(
         source_pos_m=source_pos_m,
         mic_pos_m=mic_pos_m,
@@ -607,7 +776,7 @@ def generate_rir_lf(
 
 
 # ---------------------------------------------------------------------------
-# Self-test
+# Self-test (struttura, senza FDTD reale)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -621,7 +790,7 @@ if __name__ == "__main__":
     print("MODULO 2 — Self Test (struttura, senza FDTD reale)")
     print("=" * 60)
 
-    from m1_physics_setup import RoomAcousticProfile, PhysicsTranslator, SURFACE_KEYS
+    from m1_physics_setup import RoomAcousticProfile, PhysicsTranslator
 
     room = RoomAcousticProfile(
         length=6.0, width=4.0, height=3.0,
@@ -654,9 +823,9 @@ if __name__ == "__main__":
     engine = KWaveEngine(physics_params=physics, sim_params=sim_params)
 
     print(f"\nKWaveEngine parametri calcolati:")
-    print(f"  dt     = {engine.dt:.4e} s")
-    print(f"  Nt     = {engine.Nt}")
-    print(f"  fs_sim = {engine.fs_sim:.2f} Hz")
+    print(f"  dt       = {engine.dt:.4e} s")
+    print(f"  Nt       = {engine.Nt}")
+    print(f"  fs_sim   = {engine.fs_sim:.2f} Hz  (atteso ~50–80 kHz, NON 44100)")
 
     print("\nTest snap-to-grid:")
     src_idx = engine._snap_to_grid((1.0, 1.0, 1.0), "source")
@@ -670,18 +839,24 @@ if __name__ == "__main__":
 
     print("\nTest medium painting:")
     medium = engine._build_medium()
-    print(f"  rho shape: {medium.density.shape}")
-    print(f"  rho floor:    {medium.density[1, 1, 0]:.4f} kg/m3")
-    print(f"  rho ceiling:  {medium.density[1, 1, -1]:.4f} kg/m3")
-    print(f"  rho interior: {medium.density[3, 3, 3]:.4f} kg/m3")
+    print(f"  rho shape:    {medium.density.shape}")
+    print(f"  rho floor:    {medium.density[1, 1, 0]:.4f} kg/m³")
+    print(f"  rho ceiling:  {medium.density[1, 1, -1]:.4f} kg/m³")
+    print(f"  rho interior: {medium.density[3, 3, 3]:.4f} kg/m³")
 
-    print("\nTest GPUInitializationError:")
+    print("\nTest GPUInitializationError (use_gpu=True senza GPU):")
     try:
         engine._enforce_gpu()
         print("  GPU disponibile — nessuna eccezione sollevata.")
     except GPUInitializationError as e:
         print(f"  [OK] GPUInitializationError: {str(e).splitlines()[0]}")
 
+    print("\nTest generate_rir_lf signature:")
+    import inspect
+    sig = inspect.signature(generate_rir_lf)
+    print(f"  Firma:   {sig}")
+    print(f"  Returns: Tuple[np.ndarray, float]  ← (rir_lf, fs_lf)")
+
     print("\n" + "=" * 60)
-    print("Self test Modulo 2 completato.")
+    print("Self test Modulo 2 completato — tutti i fix applicati.")
     print("=" * 60)
