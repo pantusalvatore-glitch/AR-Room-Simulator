@@ -397,9 +397,13 @@ class KWaveEngine:
             [self.Nx, self.Ny, self.Nz],
             [self.dx, self.dx, self.dx],
         )
+        # makeTime() imposta grid.Nt (int) e grid.dt su kWaveGrid.
+        # Senza questa chiamata grid.Nt rimane la stringa 'auto' e
+        # kspaceFirstOrder3DG solleva TypeError in input_checking.
+        grid.makeTime(C_AIR, cfl=CFL_NUMBER, t_end=self.sp.t_end_s)
         logger.info(
-            "kWaveGrid: [%d, %d, %d] voxel | dx=%.4f m",
-            self.Nx, self.Ny, self.Nz, self.dx,
+            "kWaveGrid: [%d, %d, %d] voxel | dx=%.4f m | Nt=%d | dt=%.3e s",
+            self.Nx, self.Ny, self.Nz, self.dx, grid.Nt, grid.dt,
         )
         return grid
 
@@ -674,16 +678,19 @@ class KWaveEngine:
             # - pml_x/y/z_size e pml_x/y/z_alpha sono i campi scalari supportati.
             # - NON esiste un singolo 'pml_size' scalare se si vogliono assi separati;
             #   si usa pml_x_size=pml_y_size=pml_z_size per uniformità.
-            _pml   = int(self.sp.pml_size)
+            # PML adattivo: deve essere < N/2 su ogni asse
+            _pml_max = max(4, min(self.Nx, self.Ny, self.Nz) // 2 - 1)
+            _pml   = min(int(self.sp.pml_size), _pml_max)
+            if _pml < int(self.sp.pml_size):
+                logger.warning(
+                    "PML ridotto da %d a %d (griglia min=%d voxel)",
+                    int(self.sp.pml_size), _pml, min(self.Nx, self.Ny, self.Nz)
+                )
             _alpha = float(PML_ALPHA)
 
             sim_options = SimulationOptions(
-                pml_x_size=_pml,
-                pml_y_size=_pml,
-                pml_z_size=_pml,
-                pml_x_alpha=_alpha,
-                pml_y_alpha=_alpha,
-                pml_z_alpha=_alpha,
+                pml_size=[_pml, _pml, _pml],
+                pml_inside=False,
                 smooth_p0=self.sp.smooth_source,
                 save_to_disk=True,
                 data_path=str(input_hdf5.parent),
