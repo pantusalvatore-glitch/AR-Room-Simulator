@@ -1,7 +1,0 @@
-dataset_audio/
-master_log.csv
-master_log_t30.csv
-checkpoint.json
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
